@@ -14,7 +14,6 @@ package org.springframework.security.ldap.authentication.ad;
 
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
 import org.springframework.ldap.core.DirContextOperations;
-import org.springframework.ldap.core.DistinguishedName;
 import org.springframework.ldap.core.support.DefaultDirObjectFactory;
 import org.springframework.ldap.support.LdapUtils;
 import org.springframework.security.authentication.AccountExpiredException;
@@ -34,11 +33,14 @@ import org.springframework.util.StringUtils;
 
 import javax.naming.AuthenticationException;
 import javax.naming.Context;
+import javax.naming.InvalidNameException;
 import javax.naming.NamingException;
 import javax.naming.OperationNotSupportedException;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.SearchControls;
 import javax.naming.ldap.InitialLdapContext;
+import javax.naming.ldap.LdapName;
+import javax.naming.ldap.Rdn;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -96,16 +98,11 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
     private final String rootDn;
     private final String url;
     private boolean convertSubErrorCodesToExceptions;
+    private String searchFilter = "(&(objectClass=user)(|(sAMAccountName={0})(userPrincipalName={0})))";
+    private String groupAttribute = "memberOf";
 
     // Only used to allow tests to substitute a mock LdapContext
     ContextFactory contextFactory = new ContextFactory();
-
-    /**
-     * @param domain the domain for which authentication should take place
-     */
-//    public ActiveDirectoryLdapAuthenticationProvider(String domain) {
-//        this (domain, null);
-//    }
 
     /**
      * @param domain the domain name (may be null or empty)
@@ -114,7 +111,6 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
     public ActiveDirectoryLdapAuthenticationProvider(String domain, String url) {
         Assert.isTrue(StringUtils.hasText(url), "Url cannot be empty");
         this.domain = StringUtils.hasText(domain) ? domain.toLowerCase() : null;
-        //this.url = StringUtils.hasText(url) ? url : null;
         this.url = url;
         rootDn = this.domain == null ? null : rootDnFromDomain(this.domain);
     }
@@ -122,13 +118,12 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
     @Override
     protected DirContextOperations doAuthentication(UsernamePasswordAuthenticationToken auth) {
         String username = auth.getName();
-        String password = (String)auth.getCredentials();
+        String password = (String) auth.getCredentials();
 
         DirContext ctx = bindAsUser(username, password);
 
         try {
             return searchForUser(ctx, username);
-
         } catch (NamingException e) {
             logger.error("Failed to locate directory entry for authenticated user: " + username, e);
             throw badCredentials(e);
@@ -142,33 +137,47 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
      * Active Directory entry.
      */
     @Override
-    protected Collection<? extends GrantedAuthority> loadUserAuthorities(DirContextOperations userData, String username, String password) {
-        String[] groups = userData.getStringAttributes("memberOf");
+    protected Collection<? extends GrantedAuthority> loadUserAuthorities(DirContextOperations userData,
+            String username, String password) {
+        String[] groups = userData.getStringAttributes(groupAttribute);
 
         if (groups == null) {
-            logger.debug("No values for 'memberOf' attribute.");
-
+            if (logger.isDebugEnabled()) {
+                logger.debug("No values for '" + groupAttribute + "' attribute.");
+            }
             return AuthorityUtils.NO_AUTHORITIES;
         }
 
         if (logger.isDebugEnabled()) {
-            logger.debug("'memberOf' attribute values: " + Arrays.asList(groups));
+            logger.debug("'" + groupAttribute + "' attribute values: " + Arrays.asList(groups));
         }
 
         ArrayList<GrantedAuthority> authorities = new ArrayList<GrantedAuthority>(groups.length);
 
         for (String group : groups) {
-            authorities.add(new SimpleGrantedAuthority(new DistinguishedName(group).removeLast().getValue()));
+            authorities.add(authorityFromGroup(group));
         }
 
         return authorities;
+    }
+
+    private SimpleGrantedAuthority authorityFromGroup(String group) {
+        LdapName groupLdapName;
+        try {
+            groupLdapName = new LdapName(group);
+        } catch (InvalidNameException e) {
+            throw LdapUtils.convertLdapException(e);
+        }
+        Rdn lastGroupLdapRdn = groupLdapName.getRdn(groupLdapName.size() - 1);
+        String groupName = (String) lastGroupLdapRdn.getValue();
+        return new SimpleGrantedAuthority(groupName);
     }
 
     private DirContext bindAsUser(String username, String password) {
         // TODO. add DNS lookup based on domain
         final String bindUrl = url;
 
-        Hashtable<String,String> env = new Hashtable<String,String>();
+        Hashtable<String, String> env = new Hashtable<String, String>();
         env.put(Context.SECURITY_AUTHENTICATION, "simple");
         String bindPrincipal = createBindPrincipal(username);
         env.put(Context.SECURITY_PRINCIPAL, bindPrincipal);
@@ -189,25 +198,26 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
         }
     }
 
-    void handleBindException(String bindPrincipal, NamingException exception) {
+    private void handleBindException(String bindPrincipal, NamingException exception) {
         if (logger.isDebugEnabled()) {
             logger.debug("Authentication for " + bindPrincipal + " failed:" + exception);
         }
 
         int subErrorCode = parseSubErrorCode(exception.getMessage());
 
-        if (subErrorCode > 0) {
-            logger.info("Active Directory authentication failed: " + subCodeToLogMessage(subErrorCode));
-
-            if (convertSubErrorCodesToExceptions) {
-                raiseExceptionForErrorCode(subErrorCode, exception);
-            }
-        } else {
+        if (subErrorCode <= 0) {
             logger.debug("Failed to locate AD-specific sub-error code in message");
+            return;
+        }
+
+        logger.info("Active Directory authentication failed: " + subCodeToLogMessage(subErrorCode));
+
+        if (convertSubErrorCodesToExceptions) {
+            raiseExceptionForErrorCode(subErrorCode, exception);
         }
     }
 
-    int parseSubErrorCode(String message) {
+    private int parseSubErrorCode(String message) {
         Matcher m = SUB_ERROR_CODE.matcher(message);
 
         if (m.matches()) {
@@ -217,7 +227,7 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
         return -1;
     }
 
-    void raiseExceptionForErrorCode(int code, NamingException exception) {
+    private void raiseExceptionForErrorCode(int code, NamingException exception) {
         String hexString = Integer.toHexString(code);
         Throwable cause = new ActiveDirectoryAuthenticationException(hexString, exception.getMessage(), exception);
         switch (code) {
@@ -238,7 +248,7 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
         }
     }
 
-    String subCodeToLogMessage(int code) {
+    private String subCodeToLogMessage(int code) {
         switch (code) {
             case USERNAME_NOT_FOUND:
                 return "User was not found in directory";
@@ -263,35 +273,31 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
 
     private BadCredentialsException badCredentials() {
         return new BadCredentialsException(messages.getMessage(
-                        "LdapAuthenticationProvider.badCredentials", "Bad credentials"));
+                "LdapAuthenticationProvider.badCredentials", "Bad credentials"));
     }
 
     private BadCredentialsException badCredentials(Throwable cause) {
         return (BadCredentialsException) badCredentials().initCause(cause);
     }
 
-    @SuppressWarnings("deprecation")
-    private DirContextOperations searchForUser(DirContext ctx, String username) throws NamingException {
-        SearchControls searchCtls = new SearchControls();
-        searchCtls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+    private DirContextOperations searchForUser(DirContext context, String username) throws NamingException {
+        SearchControls searchControls = new SearchControls();
+        searchControls.setSearchScope(SearchControls.SUBTREE_SCOPE);
 
-        String searchFilter = "(&(objectClass=user)(userPrincipalName={0}))";
-
-        final String bindPrincipal = createBindPrincipal(username);
-
+        String bindPrincipal = createBindPrincipal(username);
         String searchRoot = rootDn != null ? rootDn : searchRootFromPrincipal(bindPrincipal);
 
         try {
-            return SpringSecurityLdapTemplate.searchForSingleEntryInternal(ctx, searchCtls, searchRoot, searchFilter,
-                new Object[]{bindPrincipal});
+            return SpringSecurityLdapTemplate.searchForSingleEntryInternal(context, searchControls,
+                    searchRoot, searchFilter, new Object[]{username});
         } catch (IncorrectResultSizeDataAccessException incorrectResults) {
-            if (incorrectResults.getActualSize() == 0) {
-                UsernameNotFoundException userNameNotFoundException = new UsernameNotFoundException("User " + username + " not found in directory.", username);
-                userNameNotFoundException.initCause(incorrectResults);
-                throw badCredentials(userNameNotFoundException);
+            // Search should never return multiple results if properly configured - just rethrow
+            if (incorrectResults.getActualSize() != 0) {
+                throw incorrectResults;
             }
-            // Search should never return multiple results if properly configured, so just rethrow
-            throw incorrectResults;
+            UsernameNotFoundException userNameNotFoundException = new UsernameNotFoundException("User " + username
+                    + " not found in directory.", incorrectResults);
+            throw badCredentials(userNameNotFoundException);
         }
     }
 
@@ -303,7 +309,7 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
             throw badCredentials();
         }
 
-        return rootDnFromDomain(bindPrincipal.substring(atChar+ 1, bindPrincipal.length()));
+        return rootDnFromDomain(bindPrincipal.substring(atChar + 1, bindPrincipal.length()));
     }
 
     private String rootDnFromDomain(String domain) {
@@ -324,7 +330,9 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
         if (domain == null || username.toLowerCase().endsWith(domain)) {
             return username;
         }
-
+        if (username.contains("@")) {
+            username = username.substring(0, username.indexOf("@"));
+        }
         return username + "@" + domain;
     }
 
@@ -340,6 +348,26 @@ public final class ActiveDirectoryLdapAuthenticationProvider extends AbstractLda
      */
     public void setConvertSubErrorCodesToExceptions(boolean convertSubErrorCodesToExceptions) {
         this.convertSubErrorCodesToExceptions = convertSubErrorCodesToExceptions;
+    }
+
+    /**
+     * The LDAP filter string to search for the user being authenticated.
+     * Occurrences of {0} are replaced with the username@domain.
+     * Defaults to: {@code (&(objectClass=user)(|(sAMAccountName={0})(userPrincipalName={0})))}
+     *
+     * @param searchFilter the filter string
+     */
+    public void setSearchFilter(String searchFilter) {
+        this.searchFilter = searchFilter;
+    }
+
+    /**
+     * The name of the attribute which contains the user's authorities (groups).
+     *
+     * @param groupAttribute the name of the attribute (defaults to "memberOf")
+     */
+    public void setGroupAttribute(String groupAttribute) {
+        this.groupAttribute = groupAttribute;
     }
 
     static class ContextFactory {
